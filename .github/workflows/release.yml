@@ -1,0 +1,24 @@
+name: release
+
+# Un tag vX.Y.Z compile l'exe et l'attache a une release GitHub.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + zip
+        shell: pwsh
+        run: ./release.ps1
+      - name: Publier
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.sha256

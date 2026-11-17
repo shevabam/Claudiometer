@@ -1,0 +1,10 @@
+# Binaire compilé (se régénère avec build.ps1)
+*.exe
+*.pdb
+
+# Fichiers générés / locaux à chaque machine
+config.ini
+last-error.txt
+
+# Archives de release (release.ps1)
+dist/
