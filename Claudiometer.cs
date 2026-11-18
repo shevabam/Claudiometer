@@ -46,7 +46,11 @@ static class Native
     [DllImport("shell32.dll")] public static extern int SHQueryUserNotificationState(out int state);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc p, IntPtr l);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder sb, int max);
+    public delegate void WinEventProc(IntPtr hook, uint ev, IntPtr hwnd, int idObj, int idChild, uint thread, uint time);
+    [DllImport("user32.dll")] public static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr mod, WinEventProc cb, uint pid, uint tid, uint flags);
+    [DllImport("user32.dll")] public static extern bool UnhookWinEvent(IntPtr hook);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(POINT p, uint flags);
     [DllImport("shcore.dll")] public static extern int GetDpiForMonitor(IntPtr hmon, int type, out uint x, out uint y);
     [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
@@ -63,7 +67,7 @@ class Config
                   FontName = "Segoe UI", TextColor = "auto";
     public int RefreshMinutes = 5, RightOffset = 150, WarnPercent = 30, CritPercent = 10, LabelOpacity = 65;
     public float FontSize = 9;
-    public bool ShowRemaining = true, RightAuto = true, TrayIcon = false;
+    public bool ShowRemaining = true, RightAuto = true, TrayIcon = false, Debug = false;
 
     const string Defaults =
 "; Claudiometer - ce fichier est relu automatiquement (pas besoin de relancer).\r\n" +
@@ -133,6 +137,7 @@ class Config
                     case "labelopacity": int.TryParse(v, out c.LabelOpacity); break;
                     case "fontname": c.FontName = v; break;
                     case "textcolor": c.TextColor = v; break;
+                    case "debug": c.Debug = v.Equals("true", StringComparison.OrdinalIgnoreCase) || v == "1"; break;
                     case "trayicon": c.TrayIcon = !v.Equals("false", StringComparison.OrdinalIgnoreCase) && v != "0"; break;
                     case "refreshminutes": int.TryParse(v, out c.RefreshMinutes); break;
                     case "rightoffset":
@@ -368,9 +373,54 @@ class Widget : Form
     }
     protected override bool ShowWithoutActivation { get { return true; } }
 
+    // Quand on clique dans la taskbar (appli, volet, bouton...), elle se remet devant le widget. Plutot que d'attendre
+    // le tick de 2 s, on s'abonne aux changements de fenetre active / reduction / z-order et on remet aussitot le
+    // widget devant, par une courte rafale (la taskbar se re-hisse quelques dizaines de ms apres l'evenement).
+    IntPtr zHook1, zHook2; Native.WinEventProc zProc;
+    readonly System.Windows.Forms.Timer burst = new System.Windows.Forms.Timer();
+    int burstLeft; DateTime burstEnd; bool flyoutWasFg;
+    readonly System.Windows.Forms.Timer recreate = new System.Windows.Forms.Timer();
+
+    void RaiseNow()
+    {
+        if (!IsHandleCreated || hiddenFullscreen) return;
+        Native.SetWindowPos(Handle, HWND_TOPMOST, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010); // NOSIZE|NOMOVE|NOACTIVATE
+    }
+
+    void InstallZHook()
+    {
+        recreate.Tick += delegate
+        {
+            recreate.Stop();
+            if (!IsHandleCreated || hiddenFullscreen) return;
+            RecreateHandle();               // nouvelle fenetre : repart d'un etat d'affichage sain
+            Render(); Reposition();
+        };
+        burst.Interval = 30;
+        burst.Tick += delegate
+        {
+            RaiseNow();
+            if (--burstLeft <= 0) { burst.Stop(); burstEnd = DateTime.Now; }
+        };
+        zProc = delegate(IntPtr hook, uint ev, IntPtr hwnd, int idObj, int idChild, uint thread, uint time)
+        {
+            // un volet systeme (Wi-Fi, batterie...) vient de se fermer : la taskbar peut rester devant le widget
+            // meme apres un SetWindowPos ; seule la recreation de la fenetre le ramene (verifie par mesure).
+            if (ev == 0x0003 && flyoutWasFg && ProcessOf(Native.GetForegroundWindow()) != "ShellHost") { flyoutWasFg = false; recreate.Interval = 350; recreate.Start(); }
+            if (ev == 0x0003 && ProcessOf(hwnd) == "ShellHost") flyoutWasFg = true;
+            if (burst.Enabled || (DateTime.Now - burstEnd).TotalMilliseconds < 300) return; // evite de reagir a nos propres appels
+            RaiseNow(); burstLeft = 12; burst.Start(); // ~360 ms
+        };
+        // 0x0003 = EVENT_SYSTEM_FOREGROUND ; 0x0016-0x0017 = MINIMIZESTART/END ; 0x8004 = EVENT_OBJECT_REORDER
+        // flags 0x0002 = WINEVENT_SKIPOWNPROCESS (callbacks livres sur ce thread, qui a une boucle de messages)
+        zHook1 = Native.SetWinEventHook(0x0003, 0x0003, IntPtr.Zero, zProc, 0, 0, 0x0002);
+        zHook2 = Native.SetWinEventHook(0x0016, 0x0017, IntPtr.Zero, zProc, 0, 0, 0x0002);
+    }
+
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
+        InstallZHook();
         Render(); Reposition();
         fast.Start();
         ApplyInterval();
@@ -641,7 +691,16 @@ class Widget : Form
         if (popup != null) popup.Invalidate();
     }
 
+    // Dernier rendu, conserve pour pouvoir redessiner la fenetre sans tout recalculer (voir Tick).
+    Bitmap lastBmp;
     void Blit(Bitmap bmp)
+    {
+        if (lastBmp != null) lastBmp.Dispose();
+        lastBmp = (Bitmap)bmp.Clone();
+        Paint_(bmp);
+    }
+
+    void Paint_(Bitmap bmp)
     {
         IntPtr sdc = Native.GetDC(IntPtr.Zero), mdc = Native.CreateCompatibleDC(sdc);
         IntPtr hb = bmp.GetHbitmap(Color.FromArgb(0)), old = Native.SelectObject(mdc, hb);
@@ -740,6 +799,8 @@ class Widget : Form
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         if (ni != null) { ni.Visible = false; ni.Dispose(); }
+        if (zHook1 != IntPtr.Zero) Native.UnhookWinEvent(zHook1);
+        if (zHook2 != IntPtr.Zero) Native.UnhookWinEvent(zHook2);
         base.OnFormClosed(e);
     }
 
@@ -972,16 +1033,60 @@ class Widget : Form
         var sb = new StringBuilder(64); Native.GetClassName(fg, sb, 64); var c = sb.ToString();
         if (c == "Progman" || c == "WorkerW" || c.StartsWith("Shell_")) return false;
         var b = sc.Bounds;
-        return r.Left <= b.Left && r.Top <= b.Top && r.Right >= b.Right && r.Bottom >= b.Bottom;
+        bool full = r.Left <= b.Left && r.Top <= b.Top && r.Right >= b.Right && r.Bottom >= b.Bottom;
+        if (!full) return false;
+        // Les volets systeme (Wi-Fi/batterie/volume, Demarrer, recherche...) sont des fenetres XAML qui peuvent
+        // couvrir tout l'ecran : on les reconnait a leur processus, pas a leur classe de fenetre.
+        string proc = ProcessOf(fg);
+        if (SystemUi.Contains(proc)) return false;
+        if (!hidDebugDone) { hidDebugDone = true; try { File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "fullscreen-debug.txt"), DateTime.Now + " masque par : processus=" + proc + " classe=" + c + " etat=" + state); } catch { } }
+        return true;
     }
 
+    static readonly HashSet<string> SystemUi = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+        "explorer", "ShellExperienceHost", "StartMenuExperienceHost", "SearchHost", "SearchApp", "TextInputHost",
+        "ShellHost", "LockApp", "SystemSettings" };
+    bool hidDebugDone;
+
+    static string ProcessOf(IntPtr hwnd)
+    {
+        try
+        {
+            uint pid; Native.GetWindowThreadProcessId(hwnd, out pid);
+            using (var p = Process.GetProcessById((int)pid)) return p.ProcessName;
+        }
+        catch { return ""; }
+    }
+
+    bool hiddenFullscreen;
     Native.RECT lastTb;
+
+    // Diagnostic (config : Debug=true) : une ligne dans debug.log a chaque changement d'etat du widget.
+    string lastDebug;
+    void DebugState(string what, int x, int y)
+    {
+        if (!cfg.Debug) return;
+        try
+        {
+            var fg = Native.GetForegroundWindow(); Native.RECT r; Native.GetWindowRect(fg, out r);
+            var sb = new StringBuilder(64); Native.GetClassName(fg, sb, 64);
+            Native.RECT me; Native.GetWindowRect(Handle, out me);
+            string line = what + " pos=" + x + "," + y + " reel=" + me.Left + "," + me.Top + "," + me.Right + "," + me.Bottom +
+                " visible=" + Visible + " clockLeft=" + clockLeft + " tb=" + lastTb.Left + "," + lastTb.Top + "," + lastTb.Right + "," + lastTb.Bottom +
+                " fg=" + ProcessOf(fg) + "/" + sb + " " + r.Left + "," + r.Top + "," + r.Right + "," + r.Bottom;
+            if (line == lastDebug) return;
+            lastDebug = line;
+            File.AppendAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug.log"), DateTime.Now.ToString("HH:mm:ss.fff") + " " + line + "\r\n");
+        }
+        catch { }
+    }
 
     void Reposition()
     {
         if (!IsHandleCreated) return;
         var sc = PickScreen(); float s = ScaleFor(sc);
-        if (ForegroundIsFullscreen(sc)) { Native.ShowWindow(Handle, 0); return; }
+        hiddenFullscreen = ForegroundIsFullscreen(sc);
+        if (hiddenFullscreen) { DebugState("MASQUE-plein-ecran", 0, 0); Native.ShowWindow(Handle, 0); return; }
         Native.RECT t; IntPtr tbWnd;
         int x, y;
         if (TaskbarRect(sc, out t, out tbWnd))
@@ -1001,6 +1106,7 @@ class Widget : Form
             else { x = t.Left + (tw - w) / 2; y = t.Bottom - (int)(cfg.RightOffset * s) - h; }
         }
         else { var b = sc.Bounds; x = b.Right - (int)(cfg.RightOffset * s) - w; y = b.Bottom - (int)(48 * s) + ((int)(48 * s) - h) / 2; }
+        DebugState("affiche", x, y);
         Native.ShowWindow(Handle, 4); // SW_SHOWNOACTIVATE
         Native.SetWindowPos(Handle, HWND_TOPMOST, x, y, 0, 0, 0x0001 | 0x0010 | 0x0040); // NOSIZE|NOACTIVATE|SHOWWINDOW
     }
@@ -1027,6 +1133,8 @@ class Widget : Form
         }
         catch { }
         Reposition();
+        // Apres l'ouverture d'un volet de la taskbar, Windows peut perdre le contenu de la fenetre : on le redessine.
+        if (lastBmp != null && !hiddenFullscreen) Paint_(lastBmp);
     }
 }
 

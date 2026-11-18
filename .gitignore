@@ -8,3 +8,5 @@ last-error.txt
 
 # Archives de release (release.ps1)
 dist/
+fullscreen-debug.txt
+debug.log
